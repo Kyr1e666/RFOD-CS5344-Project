@@ -17,7 +17,6 @@ from sklearn.ensemble._forest import _generate_unsampled_indices
 from sklearn.metrics import roc_auc_score, r2_score, accuracy_score, confusion_matrix, classification_report
 from sklearn.preprocessing import LabelEncoder
 
-
 from data_process import clean_csv
 
 

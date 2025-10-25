@@ -49,7 +49,6 @@ def extract_arg_features(df: pd.DataFrame, args_col: str = "args") -> pd.DataFra
     print(f"✅ args 列已展平，新增 {len(all_feature_names)} 个特征。")
     return df
 
-
 def convert_dtypes_for_training(df: pd.DataFrame) -> pd.DataFrame:
     """将 timestamp、argsNum、stack_depth 转为数值型，其他全部为分类型。"""
     numeric_cols = ["timestamp", "argsNum", "stack_depth"]
