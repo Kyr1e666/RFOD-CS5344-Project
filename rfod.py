@@ -23,9 +23,23 @@ from datetime import datetime
 from collections import OrderedDict
 
 from sklearn.metrics import (
-    precision_score, recall_score, f1_score, balanced_accuracy_score,
+    precision_score, recall_score, f1_score, fbeta_score, balanced_accuracy_score,
     matthews_corrcoef, average_precision_score, precision_recall_curve
 )
+
+# 可选GPU依赖（RAPIDS cuML）
+try:
+    import cudf
+    import cupy as cp
+    from cuml.ensemble import RandomForestClassifier as cuRFClassifier
+    from cuml.ensemble import RandomForestRegressor as cuRFRegressor
+    HAS_CUML = True
+except ImportError:
+    HAS_CUML = False
+    cudf = None
+    cp = None
+    cuRFClassifier = None
+    cuRFRegressor = None
 
 
 
@@ -38,7 +52,9 @@ class RFOD:
         max_depth: int = 6,
         random_state: int = 42,
         n_jobs: int = -1,
-        verbose: bool = True
+        verbose: bool = True,
+        backend: str = "sklearn",  # "sklearn" or "cuml"
+        n_streams: int = 4  # cuML专用：GPU并行流数
     ):
         self.alpha = alpha
         self.beta = beta
@@ -47,6 +63,21 @@ class RFOD:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
+        self.backend = backend
+        self.n_streams = n_streams
+
+        # 检查cuML可用性
+        if self.backend == "cuml":
+            if not HAS_CUML:
+                raise RuntimeError(
+                    "backend='cuml' 但未检测到 cuML。\n"
+                    "请在 WSL2/Linux 环境中安装 RAPIDS:\n"
+                    "  conda create -n rapids -c rapidsai -c conda-forge -c nvidia rapids python=3.10 cudatoolkit"
+                )
+            if self.verbose:
+                print("[RFOD] 使用 GPU 加速 (cuML backend)")
+        elif self.verbose and self.backend == "sklearn":
+            print("[RFOD] 使用 CPU 计算 (sklearn backend)")
 
         self.forests_ = {}
         self.feature_types_ = {}
@@ -100,14 +131,47 @@ class RFOD:
                 X_transformed[col] = transformed_series
         return X_transformed
 
-    def _train_feature_forest(self, X: pd.DataFrame, feature_idx: int) -> Union[RandomForestClassifier, RandomForestRegressor]:
+    def _train_feature_forest(self, X: pd.DataFrame, feature_idx: int):
         """训练单个特征的预测森林"""
         X_train_df = X.drop(X.columns[feature_idx], axis=1)
         y_train = X.iloc[:, feature_idx]
 
         X_train_encoded = self._transform_data(X_train_df)
-        
+
         target_col_name = X.columns[feature_idx]
+
+        # cuML 后端
+        if self.backend == "cuml":
+            X_cu = cudf.DataFrame.from_pandas(X_train_encoded)
+
+            if self.feature_types_[feature_idx] == 'categorical':
+                if target_col_name in self.encoders_:
+                    y_train_series = y_train.astype(str).fillna("NaN_TOKEN")
+                    unseen_mask = ~y_train_series.isin(self.encoders_[target_col_name].classes_)
+                    y_train_series.loc[unseen_mask] = self.encoders_[target_col_name].classes_[0]
+                    y_train_encoded = self.encoders_[target_col_name].transform(y_train_series)
+                    y_train_encoded[unseen_mask] = -1
+                    y_train = y_train_encoded
+                y_cu = cudf.Series(pd.Series(y_train).astype('int32'))
+                forest = cuRFClassifier(
+                    n_estimators=self.n_estimators,
+                    max_depth=self.max_depth,
+                    random_state=self.random_state,
+                    n_streams=self.n_streams
+                )
+            else:
+                y_train = y_train.fillna(y_train.mean())
+                y_cu = cudf.Series(pd.Series(y_train).astype('float32'))
+                forest = cuRFRegressor(
+                    n_estimators=self.n_estimators,
+                    max_depth=self.max_depth,
+                    random_state=self.random_state,
+                    n_streams=self.n_streams
+                )
+            forest.fit(X_cu, y_cu)
+            return forest
+
+        # sklearn 后端（原逻辑）
         if self.feature_types_[feature_idx] == 'categorical':
             if target_col_name in self.encoders_:
                 y_train_series = y_train.astype(str).fillna("NaN_TOKEN")
@@ -116,7 +180,7 @@ class RFOD:
                 y_train_encoded = self.encoders_[target_col_name].transform(y_train_series)
                 y_train_encoded[unseen_mask] = -1
                 y_train = y_train_encoded
-            
+
             forest = RandomForestClassifier(
                 n_estimators=self.n_estimators,
                 max_depth=self.max_depth,
@@ -135,17 +199,23 @@ class RFOD:
                 oob_score=True,
                 bootstrap=True
             )
-            
+
         forest.fit(X_train_encoded, y_train)
         return forest
 
     def _prune_forest(self, forest, X: pd.DataFrame, feature_idx: int):
         """使用真实的 OOB 样本修剪森林"""
+        # cuML 不支持逐树修剪
+        if self.backend == "cuml":
+            if self.verbose and self.beta < 1.0:
+                print(f"    [注意] cuML 不支持森林修剪，beta={self.beta} 将被忽略")
+            return forest
+
         X_train_df = X.drop(X.columns[feature_idx], axis=1)
         y_train = X.iloc[:, feature_idx]
 
         X_train_encoded = self._transform_data(X_train_df)
-        
+
         target_col_name = X.columns[feature_idx]
         is_classifier = isinstance(forest, RandomForestClassifier)
         
@@ -264,9 +334,39 @@ class RFOD:
         forest = self.forests_[feature_idx]
         X_input_df = X.drop(X.columns[feature_idx], axis=1)
         X_input_encoded = self._transform_data(X_input_df)
-        
+
         n_samples = X_input_encoded.shape[0]
-        
+
+        # cuML 后端
+        if self.backend == "cuml":
+            X_cu = cudf.DataFrame.from_pandas(X_input_encoded)
+
+            if isinstance(forest, (cuRFClassifier,)) or hasattr(forest, 'predict_proba'):
+                proba = forest.predict_proba(X_cu)
+                # 转换回 numpy
+                if hasattr(proba, 'values'):
+                    proba_np = proba.values.get() if hasattr(proba.values, 'get') else proba.values
+                elif hasattr(proba, 'get'):
+                    proba_np = proba.get()
+                else:
+                    proba_np = cp.asnumpy(proba) if isinstance(proba, cp.ndarray) else np.array(proba)
+                # 不确定度用 1 - max_prob 近似
+                uncertainties = 1.0 - proba_np.max(axis=1)
+                return proba_np, uncertainties
+            else:
+                # 回归
+                preds = forest.predict(X_cu)
+                if hasattr(preds, 'values'):
+                    preds_np = preds.values.get() if hasattr(preds.values, 'get') else preds.values
+                elif hasattr(preds, 'get'):
+                    preds_np = preds.get()
+                else:
+                    preds_np = cp.asnumpy(preds) if isinstance(preds, cp.ndarray) else np.array(preds)
+                # cuML 无法逐树方差，给常数 0（权重=1）
+                std = np.zeros_like(preds_np, dtype=np.float64)
+                return preds_np, std
+
+        # sklearn 后端
         if isinstance(forest, RandomForestClassifier):
             n_classes = len(forest.classes_)
             sum_probs = np.zeros((n_samples, n_classes), dtype=np.float64)
@@ -317,54 +417,70 @@ class RFOD:
                 cell_scores[:, feature_idx] = diff / denom
                 
             else:
+                # 分类特征：计算 1 - P(true_class)
                 forest = self.forests_[feature_idx]
                 classes = getattr(forest, "classes_", None)
                 if classes is None:
                     continue
-                    
+
                 target_col_name = self.feature_names_[feature_idx]
                 le = self.encoders_.get(target_col_name)
                 if le is None:
                     continue
-                
+
                 true_values_str = true_values_series.astype(str).fillna("NaN_TOKEN")
                 unseen_mask = ~true_values_str.isin(le.classes_)
                 true_values_str.loc[unseen_mask] = le.classes_[0]
                 true_values_encoded = le.transform(true_values_str)
                 true_values_encoded[unseen_mask] = -1
-                
+
+                # 向量化：避免逐行循环
+                # 构建类别到索引的映射
+                class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+
+                # 批量查找真实类别对应的概率
+                probs = np.zeros(n_samples, dtype=np.float64)
                 for i in range(n_samples):
-                    true_class_encoded = true_values_encoded[i]
-                    prob = 0.0
-                    try:
-                        idx = np.where(classes == true_class_encoded)[0]
-                        if len(idx) > 0:
-                            prob = pred_values[i, idx[0]]
-                        else:
-                            prob = 0.0
-                    except Exception:
-                        prob = 0.0
-                    cell_scores[i, feature_idx] = 1.0 - prob
+                    true_class = true_values_encoded[i]
+                    if true_class in class_to_idx:
+                        probs[i] = pred_values[i, class_to_idx[true_class]]
+                    # else: probs[i] = 0.0 (已初始化)
+
+                cell_scores[:, feature_idx] = 1.0 - probs
                     
         return cell_scores
 
-    def predict(self, X: Union[pd.DataFrame, np.ndarray], return_cell_scores: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        """预测异常分数"""
+    def predict(self, X: Union[pd.DataFrame, np.ndarray], return_cell_scores: bool = False,
+                clip_scores: bool = False, clip_min: float = 0.0, clip_max: float = 1.0) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        预测异常分数
+
+        参数:
+            X: 输入数据
+            return_cell_scores: 是否返回单元格分数
+            clip_scores: 是否裁剪分数到指定范围（默认True）
+            clip_min: 裁剪下限（默认0.0）
+            clip_max: 裁剪上限（默认1.0）
+
+        返回:
+            row_scores: 行级异常分数
+            cell_scores: 单元格分数（如果 return_cell_scores=True）
+        """
         if isinstance(X, np.ndarray):
             X = pd.DataFrame(X, columns=self.feature_names_)
-            
+
         n_samples = len(X)
         if self.verbose:
             print(f"[RFOD] 开始预测 {n_samples} 个样本...")
-            
+
         predictions = {}
         uncertainties = {}
-        
+
         for feature_idx in range(self.n_features_):
             pred, uncert = self._predict_feature(X, feature_idx)
             predictions[feature_idx] = pred
             uncertainties[feature_idx] = uncert
-            
+
         cell_scores = self._compute_cell_scores(X, predictions)
         uncertainty_matrix = np.column_stack([uncertainties[i] for i in range(self.n_features_)])
         row_sums = uncertainty_matrix.sum(axis=1, keepdims=True)
@@ -373,10 +489,17 @@ class RFOD:
         weights = 1.0 - uncertainty_norm
         weighted_scores = weights * cell_scores
         row_scores = weighted_scores.mean(axis=1)
-        
+
+        # 裁剪分数到指定范围
+        if clip_scores:
+            original_min, original_max = row_scores.min(), row_scores.max()
+            row_scores = np.clip(row_scores, clip_min, clip_max)
+            if self.verbose and (original_min < clip_min or original_max > clip_max):
+                print(f"[RFOD] 分数已裁剪: [{original_min:.6f}, {original_max:.6f}] -> [{row_scores.min():.6f}, {row_scores.max():.6f}]")
+
         if self.verbose:
             print(f"[RFOD] 预测完成，row_scores 范围: [{row_scores.min():.6f}, {row_scores.max():.6f}]")
-            
+
         if return_cell_scores:
             return row_scores, cell_scores
         else:
@@ -432,8 +555,8 @@ def _compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.
     out["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
     out["recall"] = float(recall_score(y_true, y_pred, zero_division=0))  # = TPR / sensitivity
     out["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-    out["f0p5"] = float(f1_score(y_true, y_pred, beta=0.5, zero_division=0))
-    out["f2"] = float(f1_score(y_true, y_pred, beta=2.0, zero_division=0))
+    out["f0p5"] = float(fbeta_score(y_true, y_pred, beta=0.5, zero_division=0))
+    out["f2"] = float(fbeta_score(y_true, y_pred, beta=2.0, zero_division=0))
     out["mcc"] = float(matthews_corrcoef(y_true, y_pred)) if (tp+tn+fp+fn) > 0 else 0.0
 
     # 特异度/假阳性率
@@ -759,16 +882,16 @@ if __name__ == "__main__":
 
     param_grid = {
         # alpha: 控制分位数范围，更小的值可能捕获更多异常模式
-        "alpha": [0.005,0.0025],
+        "alpha": [0.005],
 
         # beta: 森林修剪比例，更高的值保留更多树，可能提高稳定性
         "beta": [0.7],
 
         # 增加树的数量，提高模型稳定性
-        "n_estimators": [150],
+        "n_estimators": [80],
 
         # 调整树的深度，更深可能捕获更复杂的模式
-        "max_depth": [15, 20]  # None表示不限制深度
+        "max_depth": [20]  # None表示不限制深度
     }
     
     res = train_validate_pipeline(
@@ -777,6 +900,7 @@ if __name__ == "__main__":
         process_args=False,
         threshold=None,
         threshold_percentile=99.7,
+
         verbose=True,
         drop_labelled_anomalies=False,
         param_grid=param_grid
