@@ -108,7 +108,7 @@ def clean_csv(input_path: str, output_path: str, process_args: bool = True, save
 
 
 if __name__ == "__main__":
-    input_file = "data/sample_processes_train.csv"
+    input_file = "data/processes_train.csv"
     output_file = "data/cleaned_train.csv"
    
     SHOULD_PROCESS_ARGS = False

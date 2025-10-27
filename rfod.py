@@ -18,6 +18,14 @@ from sklearn.metrics import roc_auc_score, r2_score, accuracy_score, confusion_m
 from sklearn.preprocessing import LabelEncoder
 
 from data_process import clean_csv
+import hashlib
+from datetime import datetime
+from collections import OrderedDict
+
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score, balanced_accuracy_score,
+    matthews_corrcoef, average_precision_score, precision_recall_curve
+)
 
 
 
@@ -378,6 +386,74 @@ class RFOD:
         self.fit(X_train)
         return self.predict(X_test, return_cell_scores=return_cell_scores)
 
+def _stable_param_signature(params: Dict) -> Tuple[str, OrderedDict, str]:
+    """
+    依据超参数字典生成稳定的文件名签名。
+    返回: (signature, ordered_params, readable_str)
+    """
+    ordered = OrderedDict(sorted(params.items(), key=lambda x: x[0]))
+    readable = "_".join([f"{k}={ordered[k]}" for k in ordered])
+    # 文件名友好（小数点 -> p，空格去掉）
+    safe = readable.replace(" ", "").replace(".", "p")
+    md5 = hashlib.md5(readable.encode()).hexdigest()[:8]
+    return f"{safe}__{md5}", ordered, readable
+
+
+def _scan_thresholds_from_scores(scores: np.ndarray, n_points: int = 256) -> np.ndarray:
+    """
+    从分数分布中抽取候选阈值（基于分位数，去重），用于在验证集上选最优阈值。
+    """
+    qs = np.linspace(0.0, 1.0, num=n_points)
+    thrs = np.quantile(scores, qs)
+    return np.unique(thrs)
+
+
+def _compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray) -> Dict[str, Union[float, int, None]]:
+    """
+    针对异常检测（二分类：1=异常），给出全面指标。
+    y_score: 连续分数（越大越“异常”）
+    y_pred: 经过阈值后的 0/1 预测
+    """
+    out: Dict[str, Union[float, int, None]] = {}
+
+    # 混淆矩阵元素
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        # 单类退化情形
+        tn = cm[0, 0] if cm.shape == (1, 1) and y_true[0] == 0 else 0
+        fp = fn = tp = 0
+    out.update(dict(tp=int(tp), fp=int(fp), tn=int(tn), fn=int(fn)))
+
+    # 基础指标
+    out["accuracy"] = float(accuracy_score(y_true, y_pred))
+    out["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
+    out["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
+    out["recall"] = float(recall_score(y_true, y_pred, zero_division=0))  # = TPR / sensitivity
+    out["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
+    out["f0p5"] = float(f1_score(y_true, y_pred, beta=0.5, zero_division=0))
+    out["f2"] = float(f1_score(y_true, y_pred, beta=2.0, zero_division=0))
+    out["mcc"] = float(matthews_corrcoef(y_true, y_pred)) if (tp+tn+fp+fn) > 0 else 0.0
+
+    # 特异度/假阳性率
+    tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    fpr = 1.0 - tnr
+    out["specificity"] = float(tnr)
+    out["fpr"] = float(fpr)
+    out["youden_j"] = float(out["recall"] - fpr)
+
+    # 曲线类指标（对单类退化要兜底）
+    try:
+        out["roc_auc"] = float(roc_auc_score(y_true, y_score))
+    except Exception:
+        out["roc_auc"] = None
+    try:
+        out["pr_auc"] = float(average_precision_score(y_true, y_score))
+    except Exception:
+        out["pr_auc"] = None
+
+    return out
 
 # Pipeline 相关代码
 REQ_FEATURES = [
@@ -402,21 +478,41 @@ def _select_and_align_features(df: pd.DataFrame, feature_names: List[str]) -> pd
             print(f"⚠️ 特征缺失，已用 NaN 填充: {f}")
     return out
 
-def train_validate_pipeline(train_csv: str, valid_csv: str, process_args: bool = True,
-                            threshold: Optional[float] = None, threshold_percentile: int = 95,
-                            verbose: bool = True, drop_labelled_anomalies: bool = False,
-                            param_grid: Optional[Dict[str, List]] = None) -> Dict[str, float]:
-    
+def train_validate_pipeline(
+    train_csv: str,
+    valid_csv: str,
+    process_args: bool = True,
+    threshold: Optional[float] = None,
+    threshold_percentile: int = 95,
+    verbose: bool = True,
+    drop_labelled_anomalies: bool = False,
+    param_grid: Optional[Dict[str, List]] = None,
+    # === 新增：比较方式与阈值策略 ===
+    selection_metric: str = "f1",          # 可选: 'f1' | 'pr_auc' | 'roc_auc' | 'balanced_accuracy' | 'youden_j' | 'accuracy' | 'mcc'
+    threshold_strategy: str = "train_quantile",   # 可选: 'train_quantile' | 'valid_best_f1' | 'valid_best_j'
+    # === 新增：保存控制 ===
+    out_dir: str = "model",
+    save_all_models: bool = True,
+    max_thr_scan_points: int = 256,
+) -> Dict[str, Union[float, int, str]]:
+    """
+    训练+验证流程。关键增强：
+      - 每个超参组合的模型都会各自保存（含阈值与评测）；
+      - 保存整表 metrics 到 CSV/JSONL；
+      - 最佳模型按 selection_metric 选择。
+    """
+
     print(f"--> 清洗训练集: {train_csv}")
     df_train = _safe_clean_csv(train_csv, process_args=process_args)
     if df_train.empty:
         print(f"错误: 无法加载或清洗 {train_csv}")
         return {}
-        
+
     if drop_labelled_anomalies and "target" in df_train.columns:
         before = len(df_train)
         df_train = df_train[df_train["target"].astype(str) != "1"]
         print(f"  已移除 {before - len(df_train)} 个标注为异常的训练样本")
+
     X_train = _select_and_align_features(df_train, REQ_FEATURES)
     if X_train.empty:
         print("错误: 训练数据为空或所有特征缺失。")
@@ -427,106 +523,252 @@ def train_validate_pipeline(train_csv: str, valid_csv: str, process_args: bool =
     if df_valid.empty:
         print(f"错误: 无法加载或清洗 {valid_csv}")
         return {}
-        
+
     if "target" not in df_valid.columns:
-        print("警告: 验证集必须包含 'target' 列。")
+        print("警告: 验证集必须包含 'target' 列，已用 0 填充。")
         df_valid["target"] = 0
-        
+
     X_valid = _select_and_align_features(df_valid, REQ_FEATURES)
     y_true = df_valid["target"].astype(int).values
     if X_valid.empty:
         print("错误: 验证数据为空。")
         return {}
 
-    best_acc = -1.0
-    best_params = None
-    best_model = None
-    best_thr = None
-    best_preds = None
-    best_report = None
-    best_cm = None
+    # === 输出目录 ===
+    os.makedirs(out_dir, exist_ok=True)
+    all_dir = os.path.join(out_dir, "all")
+    os.makedirs(all_dir, exist_ok=True)
 
+    metrics_rows: List[Dict[str, Union[str, int, float, None]]] = []
+
+    def _select_best(rows: List[Dict]) -> Dict:
+        """
+        按 selection_metric 选择最优（越大越好）。若 metric 缺失则按顺序回退。
+        """
+        order = [selection_metric, "pr_auc", "roc_auc", "f1", "balanced_accuracy", "accuracy", "youden_j", "mcc"]
+        def key_fn(r):
+            for m in order:
+                v = r.get(m, None)
+                if v is not None:
+                    return v
+            return -1e9
+        return max(rows, key=key_fn) if rows else {}
+
+    # === 单模型流程（未给 param_grid） ===
     if param_grid is None:
         print("--> 使用默认参数训练 RFOD")
-        rfod = RFOD(verbose=verbose)
+        params = dict(alpha=0.02, beta=0.7, n_estimators=30, max_depth=6, random_state=42, n_jobs=-1)  # 与 __init__ 保持一致
+        rfod = RFOD(verbose=verbose, **params)
         rfod.fit(X_train)
+
         train_scores = rfod.predict(X_train)
-        if threshold is None:
-            thr = float(np.percentile(train_scores, threshold_percentile))
-            print(f"--> 使用训练集 {threshold_percentile}th 百分位作为阈值: {thr:.6f}")
-        else:
+        if threshold is not None:
             thr = float(threshold)
-            print(f"--> 使用用户指定阈值: {thr:.6f}")
+            thr_src = "user_provided"
+        elif threshold_strategy == "train_quantile":
+            thr = float(np.percentile(train_scores, threshold_percentile))
+            thr_src = f"train_quantile_{threshold_percentile}"
+        else:
+            # 需要验证集分数来选阈值
+            valid_scores = rfod.predict(X_valid)
+            if threshold_strategy == "valid_best_f1":
+                candidates = _scan_thresholds_from_scores(valid_scores, n_points=max_thr_scan_points)
+                best_f1, thr = -1.0, candidates[0]
+                for t in candidates:
+                    yp = (valid_scores > t).astype(int)
+                    f1v = f1_score(y_true, yp, zero_division=0)
+                    if f1v > best_f1:
+                        best_f1, thr = f1v, float(t)
+                thr_src = "valid_best_f1"
+            elif threshold_strategy == "valid_best_j":
+                candidates = _scan_thresholds_from_scores(valid_scores, n_points=max_thr_scan_points)
+                best_j, thr = -1.0, candidates[0]
+                for t in candidates:
+                    yp = (valid_scores > t).astype(int)
+                    cm = confusion_matrix(y_true, yp, labels=[0, 1])
+                    if cm.size == 4:
+                        tn, fp, fn, tp = cm.ravel()
+                        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+                        j = tpr - fpr
+                    else:
+                        j = 0.0
+                    if j > best_j:
+                        best_j, thr = j, float(t)
+                thr_src = "valid_best_j"
+            else:
+                raise ValueError(f"Unknown threshold_strategy: {threshold_strategy}")
+
         valid_scores = rfod.predict(X_valid)
-        preds = (valid_scores > thr).astype(int)
-        acc = accuracy_score(y_true, preds)
-        cm = confusion_matrix(y_true, preds)
-        report = classification_report(y_true, preds, digits=4, zero_division=0)
-        best_acc = acc
-        best_params = rfod.__dict__
-        best_model = rfod
-        best_thr = thr
-        best_preds = preds
-        best_report = report
-        best_cm = cm
+        y_pred = (valid_scores > thr).astype(int)
+        metrics = _compute_binary_metrics(y_true, valid_scores, y_pred)
+
+        # 保存当前模型
+        sig, ord_params, readable = _stable_param_signature(params)
+        model_path = os.path.join(all_dir, f"rfod_{sig}.pkl")
+        with open(model_path, "wb") as f:
+            pickle.dump(
+                {
+                    "model": rfod,
+                    "threshold": thr,
+                    "threshold_source": thr_src,
+                    "params": dict(ord_params),
+                    "metrics": metrics,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+            )
+        print(f"--> 已保存模型: {model_path}")
+
+        # 记录指标
+        row = dict(signature=sig, threshold=thr, threshold_source=thr_src, n_valid=len(y_true))
+        row.update(dict(ord_params))
+        row.update(metrics)
+        metrics_rows.append(row)
+
+        best_row = row  # 只有一个
+
+    # === 网格搜索流程 ===
     else:
         print("--> 开始网格搜索...")
         keys, values = zip(*param_grid.items())
-        combinations = list(itertools.product(*values))
-        n_combos = len(combinations)
-        print(f"  总参数组合数: {n_combos}")
-        for idx, combo in enumerate(combinations, 1):
+        combos = list(itertools.product(*values))
+        print(f"  总参数组合数: {len(combos)}")
+
+        for idx, combo in enumerate(combos, 1):
             params = dict(zip(keys, combo))
-            print(f"  [{idx}/{n_combos}] 测试参数: {params}")
-            rfod = RFOD(**params, verbose=verbose)
+            print(f"  [{idx}/{len(combos)}] 测试参数: {params}")
+
+            rfod = RFOD(verbose=verbose, **params)
             rfod.fit(X_train)
+
             train_scores = rfod.predict(X_train)
-            if threshold is None:
-                thr = float(np.percentile(train_scores, threshold_percentile))
-            else:
-                thr = float(threshold)
+            # 先拿验证分数，以便可能的阈值搜索
             valid_scores = rfod.predict(X_valid)
-            preds = (valid_scores > thr).astype(int)
-            acc = accuracy_score(y_true, preds)
-            if acc > best_acc:
-                best_acc = acc
-                best_params = params
-                best_model = rfod
-                best_thr = thr
-                best_preds = preds
-                best_cm = confusion_matrix(y_true, preds)
-                best_report = classification_report(y_true, preds, digits=4, zero_division=0)
-        print(f"--> 最佳参数: {best_params}")
-        print(f"--> 最佳 accuracy: {best_acc:.6f}")
 
-    model_dir = 'model'
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir)
-    model_path = os.path.join(model_dir, 'best_model.pkl')
-    
-    save_data = {'model': best_model, 'threshold': best_thr}
-    with open(model_path, 'wb') as f:
-        pickle.dump(save_data, f)
-    print(f"--> 已保存最佳模型和阈值到 '{model_path}'")
+            if threshold is not None:
+                thr = float(threshold)
+                thr_src = "user_provided"
+            elif threshold_strategy == "train_quantile":
+                thr = float(np.percentile(train_scores, threshold_percentile))
+                thr_src = f"train_quantile_{threshold_percentile}"
+            elif threshold_strategy == "valid_best_f1":
+                candidates = _scan_thresholds_from_scores(valid_scores, n_points=max_thr_scan_points)
+                best_f1, thr = -1.0, candidates[0]
+                for t in candidates:
+                    yp = (valid_scores > t).astype(int)
+                    f1v = f1_score(y_true, yp, zero_division=0)
+                    if f1v > best_f1:
+                        best_f1, thr = f1v, float(t)
+                thr_src = "valid_best_f1"
+            elif threshold_strategy == "valid_best_j":
+                candidates = _scan_thresholds_from_scores(valid_scores, n_points=max_thr_scan_points)
+                best_j, thr = -1.0, candidates[0]
+                for t in candidates:
+                    yp = (valid_scores > t).astype(int)
+                    cm = confusion_matrix(y_true, yp, labels=[0, 1])
+                    if cm.size == 4:
+                        tn, fp, fn, tp = cm.ravel()
+                        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+                        j = tpr - fpr
+                    else:
+                        j = 0.0
+                    if j > best_j:
+                        best_j, thr = j, float(t)
+                thr_src = "valid_best_j"
+            else:
+                raise ValueError(f"Unknown threshold_strategy: {threshold_strategy}")
 
-    print("\n=== 验证结果 ===")
-    print(f"验证集样本数: {len(y_true)}")
-    print(f"Accuracy: {best_acc:.6f}")
-    print("Confusion matrix:\n", best_cm)
-    print("Classification report:\n", best_report)
+            y_pred = (valid_scores > thr).astype(int)
+            metrics = _compute_binary_metrics(y_true, valid_scores, y_pred)
 
-    return {"accuracy": best_acc, "threshold": best_thr, "n_valid": len(y_true)}
+            # 保存“每个模型”
+            sig, ord_params, readable = _stable_param_signature(params)
+            model_path = os.path.join(all_dir, f"rfod_{sig}.pkl")
+            if save_all_models:
+                with open(model_path, "wb") as f:
+                    pickle.dump(
+                        {
+                            "model": rfod,
+                            "threshold": thr,
+                            "threshold_source": thr_src,
+                            "params": dict(ord_params),
+                            "metrics": metrics,
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                        },
+                        f,
+                    )
+                print(f"    -> 已保存: {model_path}")
+
+            row = dict(signature=sig, threshold=thr, threshold_source=thr_src, n_valid=len(y_true))
+            row.update(dict(ord_params))
+            row.update(metrics)
+            metrics_rows.append(row)
+
+        # 选择最优
+        best_row = _select_best(metrics_rows)
+        print(f"--> 最佳组合（按 {selection_metric} 选）: {best_row.get('signature')}")
+        if selection_metric in best_row:
+            print(f"    {selection_metric} = {best_row[selection_metric]:.6f}")
+
+        # 将最优模型另存为 best_model.pkl（从 all 中取回）
+        best_sig = best_row["signature"]
+        best_model_pkl = os.path.join(all_dir, f"rfod_{best_sig}.pkl")
+        with open(best_model_pkl, "rb") as f:
+            payload = pickle.load(f)
+        # 单独再放一份
+        with open(os.path.join(out_dir, "best_model.pkl"), "wb") as f:
+            pickle.dump(payload, f)
+        print(f"--> 已保存最佳模型副本到: {os.path.join(out_dir, 'best_model.pkl')}")
+
+    # 汇总表保存
+    if metrics_rows:
+        dfm = pd.DataFrame(metrics_rows)
+        csv_path = os.path.join(out_dir, "metrics.csv")
+        jsonl_path = os.path.join(out_dir, "metrics.jsonl")
+        dfm.to_csv(csv_path, index=False)
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for r in metrics_rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"--> 已保存评测汇总: {csv_path}")
+        print(f"--> 已保存评测明细: {jsonl_path}")
+
+        # 友好地打印 Top-5 排行
+        key = selection_metric if selection_metric in dfm.columns else "f1"
+        topn = dfm.sort_values(by=key, ascending=False).head(5)
+        print("\n=== TOP-5 (按 {} 降序) ===".format(key))
+        print(topn[["signature", key, "threshold", "threshold_source", "accuracy", "balanced_accuracy", "pr_auc", "roc_auc", "precision", "recall", "f1", "mcc"]].fillna("-"))
+
+    # 返回简要总结
+    ret = dict(
+        best_signature=best_row.get("signature", ""),
+        selection_metric=selection_metric,
+        best_metric_value=float(best_row.get(selection_metric, -1)) if best_row.get(selection_metric) is not None else None,
+        best_threshold=float(best_row.get("threshold", 0.0)) if "threshold" in best_row else None,
+        n_valid=len(y_true),
+        out_dir=out_dir,
+    )
+    return ret
+
 
 if __name__ == "__main__":
     
     train_csv = "data/processes_train.csv"
     valid_csv = "data/processes_valid.csv"
-    
+
     param_grid = {
-        "alpha": [0.01],
+        # alpha: 控制分位数范围，更小的值可能捕获更多异常模式
+        "alpha": [0.005,0.0025],
+
+        # beta: 森林修剪比例，更高的值保留更多树，可能提高稳定性
         "beta": [0.7],
-        "n_estimators": [30],
-        "max_depth": [10]
+
+        # 增加树的数量，提高模型稳定性
+        "n_estimators": [150],
+
+        # 调整树的深度，更深可能捕获更复杂的模式
+        "max_depth": [15, 20]  # None表示不限制深度
     }
     
     res = train_validate_pipeline(
@@ -534,7 +776,7 @@ if __name__ == "__main__":
         valid_csv=valid_csv,
         process_args=False,
         threshold=None,
-        threshold_percentile=99,
+        threshold_percentile=99.7,
         verbose=True,
         drop_labelled_anomalies=False,
         param_grid=param_grid
