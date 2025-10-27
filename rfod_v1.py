@@ -1,14 +1,18 @@
 """
-RFOD (Random Forest-based Outlier Detection)
+RFOD Complete: All-in-one implementation
+Includes: Data processing, RFOD model, Training & Inference pipeline
 """
 import os
+import ast
+import json
 import tempfile
+import pickle
 import numpy as np
 import pandas as pd
 import warnings
 warnings.filterwarnings('ignore')
 
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Any, Set
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.ensemble._forest import _generate_unsampled_indices
 from sklearn.metrics import (
@@ -17,12 +21,116 @@ from sklearn.metrics import (
     balanced_accuracy_score, matthews_corrcoef, average_precision_score
 )
 from sklearn.preprocessing import LabelEncoder
-from data_process import clean_csv
 from tqdm import tqdm
 import hashlib
 from datetime import datetime
 from collections import OrderedDict
 
+
+# ============================================================================
+# DATA PROCESSING
+# ============================================================================
+
+def parse_list_field(value: Any) -> List:
+    """Parse list-like string fields safely"""
+    if pd.isna(value):
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        return ast.literal_eval(str(value))
+    except Exception:
+        return []
+
+
+def extract_arg_features(df: pd.DataFrame, args_col: str = "args") -> pd.DataFrame:
+    """Flatten args field"""
+    if args_col not in df.columns:
+        print(f"Warning: '{args_col}' column not found, skipping args extraction")
+        return df
+
+    all_feature_names: Set[str] = set()
+    feature_types: Dict[str, Set[str]] = {}
+
+    for args_str in df[args_col]:
+        for arg in parse_list_field(args_str):
+            if isinstance(arg, dict) and "name" in arg:
+                name = arg["name"]
+                all_feature_names.add(name)
+                t = arg.get("type", "unknown")
+                feature_types.setdefault(name, set()).add(t)
+
+    all_feature_names = sorted(list(all_feature_names))
+
+    flattened_features = []
+    for args_str in df[args_col]:
+        feature_map = {name: None for name in all_feature_names}
+        for arg in parse_list_field(args_str):
+            if isinstance(arg, dict) and "name" in arg and "value" in arg:
+                feature_map[arg["name"]] = arg["value"]
+        flattened_features.append(feature_map)
+
+    args_df = pd.DataFrame(flattened_features)
+    df = pd.concat([df.reset_index(drop=True), args_df.reset_index(drop=True)], axis=1)
+
+    print(f"Args flattened: {len(all_feature_names)} new features")
+    return df
+
+
+def convert_dtypes_for_training(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert dtypes: numeric for timestamp/argsNum/stack_depth, categorical for others"""
+    numeric_cols = ["timestamp", "argsNum", "stack_depth"]
+    for col in df.columns:
+        if col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif col != "args":
+            df[col] = df[col].astype(str)
+    print(f"Type conversion: {len(numeric_cols)} numeric features")
+    return df
+
+
+def clean_csv(input_path: str, output_path: str, process_args: bool = True, save: bool = True):
+    """Main data cleaning function"""
+    print(f"Processing: {input_path}")
+    df = pd.read_csv(input_path)
+
+    if "stackAddresses" in df.columns:
+        df["stackAddresses"] = df["stackAddresses"].apply(parse_list_field)
+        df["stack_depth"] = df["stackAddresses"].apply(len)
+        print("stack_depth feature computed")
+
+    drop_cols = ["threadId", "eventId", "stackAddresses"]
+    df = df.drop(columns=[col for col in drop_cols if col in df.columns], errors="ignore")
+    print(f"Dropped columns: {drop_cols}")
+
+    args_col_present = "args" in df.columns
+    if process_args and args_col_present:
+        df = extract_arg_features(df, args_col="args")
+        df = df.drop(columns=["args"], errors="ignore")
+    elif not process_args and args_col_present:
+        df = df.drop(columns=["args"], errors="ignore")
+        print("Skipped 'args' processing")
+    elif process_args and not args_col_present:
+        print("Warning: 'args' column not found")
+
+    if "processId" in df.columns and "timestamp" in df.columns:
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+        df["timestamp"] = df.groupby("processId")["timestamp"].transform(lambda x: x - x.min())
+        print("Timestamp normalized by processId")
+    else:
+        print("Warning: Missing processId or timestamp, skipping normalization")
+
+    df = convert_dtypes_for_training(df)
+
+    if save:
+        df.to_csv(output_path, index=False)
+        print(f"Cleaned data saved to: {output_path}")
+    return df
+
+
+# ============================================================================
+# RFOD MODEL
+# ============================================================================
 
 class RFOD:
     def __init__(
@@ -351,62 +459,10 @@ class RFOD:
         else:
             return row_scores
 
-    def fit_predict(self, X_train: Union[pd.DataFrame, np.ndarray], X_test: Union[pd.DataFrame, np.ndarray], return_cell_scores: bool = False):
-        self.fit(X_train)
-        return self.predict(X_test, return_cell_scores=return_cell_scores)
 
-
-def _stable_param_signature(params: Dict) -> Tuple[str, OrderedDict, str]:
-    ordered = OrderedDict(sorted(params.items(), key=lambda x: x[0]))
-    readable = "_".join([f"{k}={ordered[k]}" for k in ordered])
-    safe = readable.replace(" ", "").replace(".", "p")
-    md5 = hashlib.md5(readable.encode()).hexdigest()[:8]
-    return f"{safe}__{md5}", ordered, readable
-
-
-def _scan_thresholds_from_scores(scores: np.ndarray, n_points: int = 256) -> np.ndarray:
-    qs = np.linspace(0.0, 1.0, num=n_points)
-    thrs = np.quantile(scores, qs)
-    return np.unique(thrs)
-
-
-def _compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray) -> Dict[str, Union[float, int, None]]:
-    out: Dict[str, Union[float, int, None]] = {}
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    if cm.size == 4:
-        tn, fp, fn, tp = cm.ravel()
-    else:
-        tn = cm[0, 0] if cm.shape == (1, 1) and y_true[0] == 0 else 0
-        fp = fn = tp = 0
-    out.update(dict(tp=int(tp), fp=int(fp), tn=int(tn), fn=int(fn)))
-
-    out["accuracy"] = float(accuracy_score(y_true, y_pred))
-    out["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
-    out["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
-    out["recall"] = float(recall_score(y_true, y_pred, zero_division=0))
-    out["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-    out["f0p5"] = float(fbeta_score(y_true, y_pred, beta=0.5, zero_division=0))
-    out["f2"] = float(fbeta_score(y_true, y_pred, beta=2.0, zero_division=0))
-    out["mcc"] = float(matthews_corrcoef(y_true, y_pred)) if (tp+tn+fp+fn) > 0 else 0.0
-
-    tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    fpr = 1.0 - tnr
-    out["specificity"] = float(tnr)
-    out["fpr"] = float(fpr)
-    out["youden_j"] = float(out["recall"] - fpr)
-
-    try:
-        out["roc_auc"] = float(roc_auc_score(y_true, y_score))
-    except Exception:
-        out["roc_auc"] = None
-    try:
-        out["pr_auc"] = float(average_precision_score(y_true, y_score))
-    except Exception:
-        out["pr_auc"] = None
-
-    return out
-
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 REQ_FEATURES = [
     "timestamp", "processId", "parentProcessId", "userId", "mountNamespace",
@@ -429,3 +485,224 @@ def _select_and_align_features(df: pd.DataFrame, feature_names: List[str]) -> pd
             out[f] = np.nan
             print(f"Warning: missing feature '{f}', filled with NaN")
     return out
+
+
+def _stable_param_signature(params: Dict) -> Tuple[str, OrderedDict, str]:
+    ordered = OrderedDict(sorted(params.items(), key=lambda x: x[0]))
+    readable = "_".join([f"{k}={ordered[k]}" for k in ordered])
+    safe = readable.replace(" ", "").replace(".", "p")
+    md5 = hashlib.md5(readable.encode()).hexdigest()[:8]
+    return f"{safe}__{md5}", ordered, readable
+
+
+# ============================================================================
+# TRAINING & INFERENCE PIPELINE
+# ============================================================================
+
+def train_and_infer(
+    train_csv: str,
+    test_csv: Optional[str] = None,
+    output_path: str = "result/prediction.csv",
+    batch_size: int = 50000,
+    alpha: float = 0.02,
+    beta: float = 0.7,
+    n_estimators: int = 30,
+    max_depth: int = 6,
+    random_state: int = 42,
+    n_jobs: int = -1,
+    process_args: bool = False,
+    drop_labelled_anomalies: bool = False,
+    normalize_method: str = "minmax",
+    out_dir: str = "model",
+    verbose: bool = True
+) -> Dict:
+
+    results = {}
+
+    if verbose:
+        print("\n" + "="*60)
+        print("STEP 1: Training Model")
+        print("="*60)
+
+    if not os.path.exists(train_csv):
+        raise FileNotFoundError(f"Train file not found: {train_csv}")
+
+    df_train = _safe_clean_csv(train_csv, process_args=process_args)
+    if df_train.empty:
+        raise ValueError(f"Failed to load train data: {train_csv}")
+
+    if drop_labelled_anomalies and "target" in df_train.columns:
+        before = len(df_train)
+        df_train = df_train[df_train["target"].astype(str) != "1"]
+        if verbose:
+            print(f"Removed {before - len(df_train)} labeled anomalies from training set")
+
+    X_train = _select_and_align_features(df_train, REQ_FEATURES)
+    if X_train.empty:
+        raise ValueError("Training data is empty")
+
+    if verbose:
+        print(f"Train samples: {len(X_train)}, Features: {len(REQ_FEATURES)}")
+
+    params = {
+        'alpha': alpha,
+        'beta': beta,
+        'n_estimators': n_estimators,
+        'max_depth': max_depth,
+        'random_state': random_state,
+        'n_jobs': n_jobs,
+        'verbose': verbose
+    }
+
+    rfod = RFOD(**params)
+    rfod.fit(X_train)
+
+    if verbose:
+        print("\n" + "="*60)
+        print("STEP 2: Saving Model")
+        print("="*60)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    model_params = {
+        'alpha': alpha,
+        'beta': beta,
+        'n_estimators': n_estimators,
+        'max_depth': max_depth
+    }
+    sig, ord_params, readable = _stable_param_signature(model_params)
+
+    model_path = os.path.join(out_dir, f"rfod_{sig}.pkl")
+
+    model_data = {
+        'model': rfod,
+        'params': params,
+        'saved_at': datetime.now().isoformat(timespec="seconds"),
+    }
+
+    with open(model_path, 'wb') as f:
+        pickle.dump(model_data, f)
+
+    if verbose:
+        print(f"Model saved: {model_path}")
+
+    results['model_path'] = model_path
+    results['params'] = params
+
+    if test_csv is not None:
+        if verbose:
+            print("\n" + "="*60)
+            print("STEP 3: Testing Inference")
+            print("="*60)
+
+        if not os.path.exists(test_csv):
+            raise FileNotFoundError(f"Test file not found: {test_csv}")
+
+        df_test = _safe_clean_csv(test_csv, process_args=process_args)
+
+        if 'Id' not in df_test.columns:
+            raise ValueError("Test set must contain 'Id' column")
+
+        if verbose:
+            print(f"Test samples: {len(df_test)}")
+
+        X_test = _select_and_align_features(df_test, REQ_FEATURES)
+
+        if X_test.empty:
+            raise ValueError("Test data is empty")
+
+        test_scores = rfod.predict(X_test, clip_scores=False, batch_size=batch_size)
+
+        original_min = test_scores.min()
+        original_max = test_scores.max()
+
+        if verbose:
+            print(f"Raw score range: [{original_min:.6f}, {original_max:.6f}]")
+
+        if normalize_method == "minmax":
+            score_range = original_max - original_min
+            if score_range > 1e-10:
+                normalized_scores = (test_scores - original_min) / score_range
+            else:
+                normalized_scores = np.zeros_like(test_scores)
+
+        elif normalize_method == "robust":
+            q25, q50, q75 = np.percentile(test_scores, [25, 50, 75])
+            iqr = q75 - q25
+            if iqr > 1e-10:
+                normalized_scores = (test_scores - q50) / iqr
+                normalized_scores = (normalized_scores - normalized_scores.min()) / \
+                                  (normalized_scores.max() - normalized_scores.min())
+            else:
+                normalized_scores = np.zeros_like(test_scores)
+
+        elif normalize_method == "clip":
+            normalized_scores = np.clip(test_scores, 0.0, 1.0)
+
+        elif normalize_method == "none":
+            normalized_scores = test_scores
+
+        else:
+            raise ValueError(f"Unknown normalize_method: {normalize_method}")
+
+        out_df = pd.DataFrame({
+            'Id': df_test['Id'],
+            'target': normalized_scores
+        })
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        out_df.to_csv(output_path, index=False)
+
+        if verbose:
+            print(f"Predictions saved: {output_path}")
+            print(f"Output preview:\n{out_df.head(10)}")
+
+        results['output_path'] = output_path
+        results['n_test'] = len(df_test)
+        results['predictions'] = out_df
+
+    if verbose:
+        print("\n" + "="*60)
+        print("COMPLETE")
+        print("="*60)
+
+    return results
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    print("RFOD Training and Inference")
+    print("Local configuration: 8GB RAM")
+    print("Optimization: Reduced memory usage\n")
+
+    results = train_and_infer(
+        train_csv="data/processes_train.csv",
+        test_csv="data/processes_test.csv",
+        output_path="result/submission.csv",
+
+        batch_size=10000,
+        alpha=0.005,
+        beta=0.7,
+        n_estimators=80,
+        max_depth=20,
+        random_state=42,
+        n_jobs=4,
+
+        process_args=False,
+        drop_labelled_anomalies=False,
+
+        normalize_method="minmax",
+        out_dir="model",
+        verbose=True
+    )
+
+    print(f"\nModel saved: {results.get('model_path')}")
+    if 'output_path' in results:
+        print(f"Predictions saved: {results.get('output_path')}")
+        print(f"Test samples: {results.get('n_test')}")
